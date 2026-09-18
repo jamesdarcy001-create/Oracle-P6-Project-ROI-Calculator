@@ -526,10 +526,6 @@ function GuidedInput({ onComplete }) {
   return (
     <div className={`gi-root ${fadeOut ? "gi-fade" : ""}`}>
       <div className="gi-grid" /><div className="gi-glow" /><div className="gi-vig" />
-      <div className="gi-header">
-        <span className="gi-logo">FIELD BRIEF</span>
-        <span className="gi-step">{step + 1} / {STEPS.length}</span>
-      </div>
       <div className="gi-bar-w"><div className="gi-bar-f" style={{ width: `${progress}%` }} /></div>
       <div className="gi-center">
         {step > 0 && !showLoad && <button className="gi-back" onClick={goBack}>← BACK</button>}
