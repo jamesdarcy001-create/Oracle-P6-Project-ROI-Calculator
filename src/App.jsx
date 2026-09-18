@@ -1,5 +1,29 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, Component } from "react";
 import prescienceMark from "./assets/width_550.png?inline";
+import {
+  STATES,
+  STATE_ORDER,
+  PRESETS,
+  DEFAULTS,
+  TIPS,
+  DEFAULT_SCENARIO_NAMES,
+  guessState,
+} from "./model/constants.js";
+import { MODEL_VERSION } from "./model/assumptions.js";
+import { buildExecutiveSummary, buildStorySentence, topSensitivityDrivers } from "./model/summary.js";
+import { calc, defaultPlatformCost, buildInputsFromSector } from "./model/calc.js";
+import { fmt, scTag } from "./model/format.js";
+import { loadSession, saveSession } from "./model/persist.js";
+import {
+  parseShareHash,
+  copyShareUrl,
+  explorerStateFromShare,
+  explorerStateFromSession,
+} from "./model/share.js";
+import Landing from "./components/Landing.jsx";
+import QuickEstimate from "./components/QuickEstimate.jsx";
+import AssumptionsPanel from "./components/AssumptionsPanel.jsx";
+import { useViewportFit } from "./useViewportFit.js";
 
 // ============================================================================
 // ERROR BOUNDARY — Self-healing, prevents white screen crashes
@@ -29,117 +53,94 @@ React.createElement("div", { style: { fontSize: 12, color: "rgba(var(--trgb),0.7
 // SHARED PALETTE & CONSTANTS
 // ============================================================================
 const DARK_PAL = { GREEN: "#00FF87", BLUE: "#2476FF", ORANGE: "#E8560A", YELLOW: "#F0D000", RED: "#F03838", CYAN: "#00BCD4", SILVER: "#94A3B8", AMBER: "#FFB300", VIOLET: "#A78BFA" };
-const LIGHT_PAL = { GREEN: "#2476FF", BLUE: GREEN, ORANGE: "#C2410C", YELLOW: "#A16207", RED: "#D62828", CYAN: "#0E7490", SILVER: "#475569", AMBER: "#B45309", VIOLET: "#6D28D9" };
+/** Light: same roles as dark — green = primary/success, blue = secondary/info (not swapped). */
+const LIGHT_PAL = { GREEN: "#065F46", BLUE: "#2476FF", ORANGE: "#C2410C", YELLOW: "#A16207", RED: "#D62828", CYAN: "#0E7490", SILVER: "#475569", AMBER: "#B45309", VIOLET: "#6D28D9" };
 let GREEN = DARK_PAL.GREEN, BLUE = DARK_PAL.BLUE, ORANGE = DARK_PAL.ORANGE, YELLOW = DARK_PAL.YELLOW, RED = DARK_PAL.RED, CYAN = DARK_PAL.CYAN, SILVER = DARK_PAL.SILVER, AMBER = DARK_PAL.AMBER, VIOLET = DARK_PAL.VIOLET;
 const scColors = () => [SILVER, AMBER, VIOLET];
-function applyTheme(t) { const p = t === "light" ? LIGHT_PAL : DARK_PAL; GREEN = p.GREEN; BLUE = p.BLUE; ORANGE = p.ORANGE; YELLOW = p.YELLOW; RED = p.RED; CYAN = p.CYAN; SILVER = p.SILVER; AMBER = p.AMBER; VIOLET = p.VIOLET; if (typeof document !== "undefined") document.documentElement.classList.toggle("theme-light", t === "light"); }
+function hexToRgbTriplet(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+}
+function applyTheme(t) {
+  const p = t === "light" ? LIGHT_PAL : DARK_PAL;
+  GREEN = p.GREEN; BLUE = p.BLUE; ORANGE = p.ORANGE; YELLOW = p.YELLOW; RED = p.RED; CYAN = p.CYAN; SILVER = p.SILVER; AMBER = p.AMBER; VIOLET = p.VIOLET;
+  if (typeof document !== "undefined") {
+    const el = document.documentElement;
+    el.classList.toggle("theme-light", t === "light");
+    const cssPairs = [
+      ["--g", "--grgb", p.GREEN],
+      ["--b", "--brgb", p.BLUE],
+      ["--c", "--crgb", p.CYAN],
+      ["--r", "--rrgb", p.RED],
+      ["--y", "--yrgb", p.YELLOW],
+      ["--o", "--orgb", p.ORANGE],
+      ["--s", "--srgb", p.SILVER],
+      ["--a", "--argb", p.AMBER],
+      ["--v", "--vrgb", p.VIOLET],
+    ];
+    for (const [varHex, varRgb, hex] of cssPairs) {
+      el.style.setProperty(varHex, hex);
+      el.style.setProperty(varRgb, hexToRgbTriplet(hex));
+    }
+  }
+}
 const initialTheme = (() => { try { return (typeof localStorage !== "undefined" && localStorage.getItem("fo-theme") === "light") ? "light" : "dark"; } catch (e) { return "dark"; } })();
 applyTheme(initialTheme);
 const GLYPHS = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const BLOCKS = "░▒▓█";
-const PRESERVED = " —/.,$%:·×█░";
-const PRESERVED_REVEAL = " —/.,$█░";
+const PRESERVED = " -/.,$%:·×█░";
+const PRESERVED_REVEAL = " -/.,$█░";
 
-const STATES = {
-  NSW: { label: "NSW", full: "NEW SOUTH WALES", factor: 1.10 },
-  VIC: { label: "VIC", full: "VICTORIA", factor: 1.06 },
-  QLD: { label: "QLD", full: "QUEENSLAND", factor: 1.04 },
-  WA:  { label: "WA",  full: "WESTERN AUSTRALIA", factor: 1.12 },
-  SA:  { label: "SA",  full: "SOUTH AUSTRALIA", factor: 1.00 },
-  TAS: { label: "TAS", full: "TASMANIA", factor: 0.96 },
-  ACT: { label: "ACT", full: "AUSTRALIAN CAPITAL TERRITORY", factor: 1.08 },
-  NT:  { label: "NT",  full: "NORTHERN TERRITORY", factor: 1.14 },
-};
-const STATE_ORDER = ["NSW","VIC","QLD","WA","SA","TAS","ACT","NT"];
-function guessState() {
+const SKIP_LANDING_KEY = "fo-skip-landing";
+
+function resolveInitialAppState() {
+  if (typeof window === "undefined") {
+    return { phase: "landing", explorerRestore: null };
+  }
+  const shared = parseShareHash(window.location.hash);
+  if (shared) {
+    return { phase: "explorer", explorerRestore: explorerStateFromShare(shared) };
+  }
   try {
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
-    if (tz.includes("Sydney")) return "NSW";
-    if (tz.includes("Melbourne")) return "VIC";
-    if (tz.includes("Brisbane")) return "QLD";
-    if (tz.includes("Perth")) return "WA";
-    if (tz.includes("Adelaide")) return "SA";
-    if (tz.includes("Hobart")) return "TAS";
-    if (tz.includes("Darwin")) return "NT";
-    if (tz.includes("Canberra") || tz.includes("Currie")) return "ACT";
-  } catch {}
-  return "NSW";
+    if (localStorage.getItem(SKIP_LANDING_KEY) === "1") {
+      const session = loadSession();
+      if (session) {
+        return { phase: "explorer", explorerRestore: explorerStateFromSession(session) };
+      }
+      return { phase: "explorer", explorerRestore: null };
+    }
+  } catch {
+    /* ignore */
+  }
+  return { phase: "landing", explorerRestore: null };
 }
 
-const PRESETS = {
-  infrastructure: { label: "INFRA", permits: 500, workers: 500, inspections: 1000, incidents: 100, siteVisits: 80, staffRate: 155 },
-  commercial: { label: "COMMERCIAL", permits: 300, workers: 350, inspections: 600, incidents: 60, siteVisits: 50, staffRate: 140 },
-  residential: { label: "RESIDENTIAL", permits: 200, workers: 250, inspections: 400, incidents: 40, siteVisits: 30, staffRate: 125 },
-  industrial: { label: "INDUSTRIAL", permits: 400, workers: 600, inspections: 800, incidents: 120, siteVisits: 100, staffRate: 160 },
-  utilities: { label: "UTILITIES", permits: 450, workers: 450, inspections: 900, incidents: 90, siteVisits: 70, staffRate: 150 },
-};
-const DEFAULTS = { projectValue: 150, duration: 24, state: "NSW" };
-const TIPS = {
-  projectValue: "Total contract value in AUD millions", duration: "Project duration in months",
-  permits: "Permits to work per month", workers: "Workforce requiring inductions",
-  inspections: "Inspections per year", incidents: "Incidents and near-misses per year",
-  siteVisits: "Management site visits per month", staffRate: "Fully-loaded hourly cost (AUD)",
-  state: "Adjusts labour + regulatory benchmarks by state",
-};
+function guidedDataToExplorerRestore(data) {
+  const sector = data.sector || "infrastructure";
+  const inputs = buildInputsFromSector(sector, data);
+  const name = data.projectName || "PROJECT";
+  return {
+    guidedData: { ...data, ...inputs },
+    sector,
+    selectedState: data.state || inputs.state,
+    inputs,
+    projectName: name,
+    confirmedName: String(name).toUpperCase(),
+    scenarios: [null, null, null],
+    scenarioNames: [...DEFAULT_SCENARIO_NAMES],
+  };
+}
+
+function calcInputsFromGuided(data) {
+  const sector = data.sector || "infrastructure";
+  return buildInputsFromSector(sector, data);
+}
+
 const SHORTCUTS = [
   ["1–5", "Switch sector preset"], ["R", "Reset all to defaults"], ["← →", "Switch Analysis / Compare"],
-  ["A / B / C", "Save Scenario 1 / 2 / 3"], ["↑ ↓", "Fine-adjust focused slider"], ["N", "New analysis"],
+  ["A / B / C", "Pin scenario 1 / 2 / 3"], ["↑ ↓", "Fine-adjust focused slider"], ["N", "New analysis"],
   ["/", "Hold for shortcuts"], ["ESC", "Close panels / blur"],
 ];
-
-// ============================================================================
-// CALC ENGINE
-// ============================================================================
-function calc(i) {
-  const { projectValue: pv, duration: dur, permits, workers, inspections, incidents, siteVisits, staffRate, state } = i;
-  const s = Math.max(0.2, Math.min(3, pv / 100));
-  const d = Math.max(0.4, Math.min(1.8, dur / 24));
-  const turnover = Math.max(1, 1 + (dur - 12) * 0.02);
-  const t = {
-    permits: Math.round((permits * 12 * 1.5) * staffRate * d) || 0,
-    inductions: Math.round((workers * 0.5) * staffRate * turnover) || 0,
-    inspections: Math.round((inspections * 0.25) * staffRate * d) || 0,
-    incidents: Math.round((incidents * 1) * staffRate * d) || 0,
-    dashboards: Math.round(48 * 8 * staffRate * d * Math.min(1, (permits + inspections + incidents) / 800)) || 0,
-    paperless: Math.round(15000 * s * d * Math.min(1, (permits + inspections) / 1000)) || 0,
-  };
-  t.total = Object.values(t).reduce((a, b) => a + b, 0);
-  const hrs = Math.round(((permits * 12 * 90) + (workers * 30) + (inspections * 15) + (incidents * 60)) / 60) || 0;
-  const c = {
-    travel: Math.round(siteVisits * 12 * 0.6 * 200 * d) || 0,
-    insurance: Math.round(pv * 1e6 * 0.005 * 0.035 * Math.min(1, incidents / 50)) || 0,
-    regulatory: Math.round(25000 * s * d * Math.min(1, (incidents + inspections) / 500)) || 0,
-  };
-  c.total = Object.values(c).reduce((a, b) => a + b, 0);
-  const p = {
-    downtime: Math.round(375000 * s * d * Math.min(1.4, incidents / 70)) || 0,
-    workforce: Math.round(120000 * s * d * Math.min(1, workers / 400)) || 0,
-    disputes: Math.round(50000 * s * Math.min(1, (incidents + inspections) / 600)) || 0,
-  };
-  p.total = Object.values(p).reduce((a, b) => a + b, 0);
-  let total = t.total + c.total + p.total;
-  // State adjustment — WA/NT remote premium, TAS discount etc.
-  const stateFactor = (state && STATES[state]?.factor) || 1;
-  total = Math.round(total * stateFactor);
-  // Scale category totals for display consistency
-  if (stateFactor !== 1) {
-    const f = stateFactor;
-    t.total = Math.round(t.total * f); c.total = Math.round(c.total * f); p.total = Math.round(p.total * f);
-    Object.keys(t).forEach(k => { if (k !== "total") t[k] = Math.round(t[k] * f); });
-    Object.keys(c).forEach(k => { if (k !== "total") c[k] = Math.round(c[k] * f); });
-    Object.keys(p).forEach(k => { if (k !== "total") p[k] = Math.round(p[k] * f); });
-  }
-  const sw = pv <= 50 ? 12000 : pv <= 200 ? 12000 + ((pv - 50) / 150) * 12000 : 24000 + ((Math.min(pv, 500) - 200) / 300) * 24000;
-  const swRound = Math.round(sw / 1000) * 1000;
-  const net = total - swRound;
-  const roiX = Math.round((total / Math.max(swRound, 1)) * 10) / 10;
-  const payback = total > 0 ? Math.max(0.3, Math.round((swRound / total) * 12 * 10) / 10) : 99;
-  const yr3 = Math.round(total + total * 1.1 + total * 1.2);
-  const dailyLoss = Math.round(total / 260);
-  return { t, c, p, total, sw: swRound, net, roiX, payback, yr3, hrs, neg: net < 0, dailyLoss, stateFactor };
-}
-function fmt(n) { const a = Math.abs(n), s = n < 0 ? "−" : ""; if (a >= 1e6) return `${s}$${(a / 1e6).toFixed(1)}M`; if (a >= 1e3) return `${s}$${Math.round(a / 1e3)}K`; return `${s}$${a}`; }
-function scTag(n) { const m = /^SCENARIO\s+(\d+)$/i.exec((n || "").trim()); return m ? `S${m[1]}` : (n || "").slice(0, 3).toUpperCase(); }
 
 // ============================================================================
 // SCRAMBLE
@@ -493,6 +494,8 @@ function GuidedInput({ onComplete }) {
           permits: Number(values.permits) || PRESETS[sec].permits, inspections: Number(values.inspections) || PRESETS[sec].inspections,
           workers: Number(values.workers) || PRESETS[sec].workers, staffRate: Number(values.staffRate) || PRESETS[sec].staffRate,
           incidents: Number(values.incidents) || PRESETS[sec].incidents, siteVisits: Number(values.siteVisits) || PRESETS[sec].siteVisits,
+          platformCost: defaultPlatformCost(Number(values.projectValue) || 150),
+          platformCostAuto: true,
         });
       }, 600);
     }, 1200);
@@ -579,7 +582,7 @@ function GuidedInput({ onComplete }) {
           {loading && <div className="gi-loading"><div className="gi-loading-bar"><div className="gi-loading-fill" /></div><span className="gi-loading-txt">PROCESSING</span></div>}
         </div>
       </div>
-      <div className="gi-footer">FIELD BRIEF — PROJECT CONFIGURATION</div>
+      <div className="gi-footer">Field brief · project configuration</div>
     </div>
   );
 }
@@ -637,7 +640,7 @@ function Reveal({ data, results, onExplore }) {
           ))}
         </div>
         <div className="rv-btn-slot">
-          {allDone && <button className="rv-enter" onClick={handleExplore}>ENTER FIELD OPS →</button>}
+          {allDone && <button className="rv-enter" onClick={handleExplore}>OPEN DASHBOARD →</button>}
         </div>
       </div>
     </div>
@@ -647,7 +650,7 @@ function Reveal({ data, results, onExplore }) {
 function RevealTermLine({ active, label, value, color, barLen, dur, isHero }) {
   const [barFill, setBarFill] = useState(0);
   const [ok, setOk] = useState(false);
-  const [display, setDisplay] = useState("———");
+  const [display, setDisplay] = useState("---");
   const [resolved, setResolved] = useState(false);
   const raf = useRef(null);
   const dormant = !active && !resolved;
@@ -688,7 +691,7 @@ function RevealTermLine({ active, label, value, color, barLen, dur, isHero }) {
       <span className="rv-tl-gt" style={{ color: dormant ? "rgba(var(--trgb),0.06)" : `${color}55` }}>›</span>
       <span className="rv-tl-label" style={dormant ? { color: "rgba(var(--trgb),0.15)" } : undefined}>{label}</span>
       <span className="rv-tl-bar" style={{ color: dormant ? "rgba(var(--trgb),0.05)" : `${color}${ok ? "BB" : "55"}` }}>{blocks}</span>
-      <span className="rv-tl-ok" style={{ color: ok ? color : "transparent", visibility: ok || dormant ? "visible" : "hidden" }}>{ok ? "OK" : "——"}</span>
+      <span className="rv-tl-ok" style={{ color: ok ? color : "transparent", visibility: ok || dormant ? "visible" : "hidden" }}>{ok ? "OK" : "--"}</span>
       <span className="rv-tl-val" style={{
         color: resolved ? color : dormant ? "rgba(var(--trgb),0.07)" : "rgba(var(--trgb),0.3)",
         textShadow: resolved ? `0 0 12px ${color}25` : "none", fontSize: isHero ? 18 : 14
@@ -725,8 +728,8 @@ function Boot({ onComplete }) {
   return (
     <div className="boot"><div className="boot-grid" /><div className="boot-glow" /><div className="boot-c">
       <img src={prescienceMark} alt="Prescience" className="boot-mark" />
-      <div className="boot-logo"><Scramble text="FIELD OPS" duration={800} trigger={1} /></div>
-      <div className="boot-sub"><Scramble text="ROI ANALYSIS ENGINE" duration={600} trigger={1} /></div>
+      <div className="boot-logo"><Scramble text="NOVADE" duration={800} trigger={1} /></div>
+      <div className="boot-sub"><Scramble text="FIELD MANAGEMENT · ROI" duration={600} trigger={1} /></div>
       <div className="boot-term">{lines.map(l => (<div key={l.idx} className={`boot-ln ${l.text.includes("OPERATIONAL") ? "boot-ok" : ""}`}><span className="boot-gt">›</span> <Scramble text={l.text} duration={l.text.includes("OPERATIONAL") ? 800 : 550} trigger={l.idx + 10} /></div>))}{!ready && lines.length > 0 && <span className="boot-cur">_</span>}</div>
       <div className="boot-bar-w"><div className="boot-bar-t"><div className="boot-bar-f" style={{ width: `${progress}%` }} /></div><span className="boot-pct">{progress}%</span></div>
       {ready && <div className="boot-rdy">▸ LAUNCHING</div>}
@@ -738,6 +741,76 @@ function Boot({ onComplete }) {
 // SHARED COMPONENTS
 // ============================================================================
 function Tip({ text, children }) { const [show, setShow] = useState(false); return (<span className="tip-w" onMouseEnter={() => setShow(true)} onMouseLeave={() => setShow(false)} onClick={e => { e.stopPropagation(); setShow(!show); }}>{children}{show && <span className="tip-b">{text}</span>}</span>); }
+
+function ScenarioStrip({
+  scenarios,
+  scenarioNames,
+  scenarioNameScrambles,
+  slotFlash,
+  editingScenario,
+  editingAt,
+  editSlot,
+  onSave,
+  onLoad,
+  onClear,
+  onStartEdit,
+  onFinishEdit,
+  className = "",
+  bootClass = "",
+}) {
+  return (
+    <div className={`scenario-panel ${className} ${bootClass}`.trim()}>
+      <div className="sp-h"><span className="sl">Scenarios</span></div>
+      <div className="sp-slots">
+        {[0, 1, 2].map((i) => (
+          <div key={i} className={`slot3 ${scenarios[i] ? "slot3-saved" : ""} ${slotFlash === i ? "slot-flash" : ""}`}>
+            <div className="slot3-top">
+              {editingScenario === i && editingAt === editSlot ? (
+                <NameEditor key={`slot-edit-${i}-${editSlot}`} className="slot3-name-edit" value={scenarioNames[i]} onCommit={(v) => onFinishEdit(i, v)} />
+              ) : (
+                <span className="slot3-name" onClick={() => onStartEdit(i, editSlot)} title="Rename">
+                  {scenarios[i] ? "●" : "◌"} <Scramble text={scenarioNames[i]} duration={350} trigger={scenarioNameScrambles[i]} />
+                </span>
+              )}
+            </div>
+            <div className="slot3-actions">
+              <button type="button" className="slot3-btn" onClick={() => onSave(i)}>{slotFlash === i ? "✓" : "Pin"}</button>
+              {scenarios[i] && <button type="button" className="slot3-btn slot3-load" onClick={() => onLoad(i)}>Load</button>}
+              {scenarios[i] && <button type="button" className="slot3-btn slot3-clear" onClick={() => onClear(i)} title="Unsave">✕</button>}
+            </div>
+          </div>
+        ))}
+      </div>
+      <p className="slot3-hint sp-hint">Pin inputs here, then use Compare to diff scenarios.</p>
+    </div>
+  );
+}
+
+function BreakdownDetail({ color, rows, highlight, scr, title }) {
+  return (
+    <div
+      className="bds-detail bds-detail-inline"
+      style={{
+        borderColor: `${color}45`,
+        background: `linear-gradient(180deg, ${color}0c 0%, rgba(var(--trgb),0.02) 100%)`,
+        ["--bds-accent"]: color,
+      }}
+    >
+      <div className="bds-detail-hdr">
+        <span className="bds-detail-title" style={{ color }}>{title}</span>
+      </div>
+      {highlight && <p className="bds-detail-hl" style={{ color }}>{highlight}</p>}
+      <div className="bds-detail-rows" style={{ ["--bds-rows"]: rows.length }}>
+        {rows.map(([n, v, note], i) => (
+          <div key={i} className="bd-r">
+            <span className="bd-rn">{n}<span className="bd-rno">{note}</span></span>
+            <span className="bd-rv" style={{ color: `${color}CC` }}><Scramble text={`$${v.toLocaleString()}`} duration={280} trigger={scr} /></span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 function Num({ value, prefix = "$" }) {
   const cur = useRef(value);
   const target = useRef(value);
@@ -818,7 +891,7 @@ function HeroVal({ value, color, trigger }) {
   }, [trigger]);
 
   if (isLive) return <Num value={value} />;
-  if (display === "") return <span style={{ opacity: 0.12, fontVariantNumeric: "tabular-nums" }}>{"$" + Math.abs(value).toLocaleString().replace(/\d/g, "—")}</span>;
+  if (display === "") return <span style={{ opacity: 0.12, fontVariantNumeric: "tabular-nums" }}>{"$" + Math.abs(value).toLocaleString().replace(/\d/g, "-")}</span>;
 
   return (
     <span className="hv-wrap">
@@ -832,10 +905,19 @@ function HeroVal({ value, color, trigger }) {
 // TOP-LEVEL APP — with restart support
 // ============================================================================
 export default function App() {
-  const [phase, setPhase] = useState("mini-boot");
+  const initial = useMemo(() => resolveInitialAppState(), []);
+  const [phase, setPhase] = useState(initial.phase);
   const [guidedData, setGuidedData] = useState(null);
   const [results, setResults] = useState(null);
+  const [explorerRestore, setExplorerRestore] = useState(initial.explorerRestore);
   const [theme, setTheme] = useState(initialTheme);
+  const [skipLanding, setSkipLanding] = useState(() => {
+    try {
+      return localStorage.getItem(SKIP_LANDING_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
 
   const toggleTheme = useCallback(() => {
     const t = theme === "dark" ? "light" : "dark";
@@ -844,25 +926,84 @@ export default function App() {
     try { localStorage.setItem("fo-theme", t); } catch (e) { /* noop */ }
   }, [theme]);
 
+  const openExplorer = useCallback((data, restore) => {
+    setGuidedData(data);
+    setResults(calc(calcInputsFromGuided(data)));
+    setExplorerRestore(restore || guidedDataToExplorerRestore(data));
+    setPhase("explorer");
+  }, []);
+
+  const handleSkipIntroChange = useCallback((checked) => {
+    setSkipLanding(checked);
+    try {
+      localStorage.setItem(SKIP_LANDING_KEY, checked ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const handleMiniBoot = useCallback(() => setPhase("guided"), []);
   const handleGuided = useCallback((data) => {
-    const inputs = { projectValue: data.projectValue, duration: data.duration, permits: data.permits, workers: data.workers, inspections: data.inspections, incidents: data.incidents, siteVisits: data.siteVisits, staffRate: data.staffRate, state: data.state };
-    setGuidedData(data); setResults(calc(inputs)); setPhase("reveal");
+    setGuidedData(data);
+    setResults(calc(calcInputsFromGuided(data)));
+    setPhase("reveal");
   }, []);
   const handleExplore = useCallback(() => setPhase("boot"), []);
-  const handleBoot = useCallback(() => setPhase("explorer"), []);
+  const handleBoot = useCallback(() => {
+    setExplorerRestore(guidedData ? guidedDataToExplorerRestore(guidedData) : null);
+    setPhase("explorer");
+  }, [guidedData]);
   const handleSkip = useCallback(() => setPhase("explorer"), []);
-  const handleRestart = useCallback(() => { setGuidedData(null); setResults(null); setPhase("mini-boot"); }, []);
+  const handleRestart = useCallback(() => {
+    setGuidedData(null);
+    setResults(null);
+    setExplorerRestore(null);
+    setPhase(skipLanding ? "explorer" : "landing");
+  }, [skipLanding]);
+
+  useViewportFit(phase);
 
   return (
     <ErrorBoundary>
     <div className="app-theme-wrap">
+      {phase === "landing" && (
+        <Landing
+          onQuick={() => setPhase("quick")}
+          onGuided={() => setPhase("mini-boot")}
+          onResume={() => {
+            const session = loadSession();
+            if (session) {
+              setExplorerRestore(explorerStateFromSession(session));
+              setGuidedData(session.guidedData || null);
+              setPhase("explorer");
+            }
+          }}
+          skipIntro={skipLanding}
+          onSkipIntroChange={handleSkipIntroChange}
+        />
+      )}
+      {phase === "quick" && (
+        <QuickEstimate
+          onBack={() => setPhase("landing")}
+          onComplete={(data) => openExplorer(data)}
+        />
+      )}
       {phase === "mini-boot" && <MiniBoot onComplete={handleMiniBoot} />}
       {phase === "guided" && <GuidedInput onComplete={handleGuided} />}
       {phase === "reveal" && <Reveal data={guidedData} results={results} onExplore={handleExplore} />}
       {phase === "boot" && <Boot onComplete={handleBoot} />}
-      {phase === "explorer" && <Explorer initialData={guidedData} onRestart={handleRestart} theme={theme} toggleTheme={toggleTheme} />}
-      {phase !== "explorer" && <button className="skip-btn" onClick={handleSkip} title="Skip to Field Ops">SKIP ▸</button>}
+      {phase === "explorer" && (
+        <Explorer
+          initialData={guidedData}
+          restoreState={explorerRestore}
+          onRestart={handleRestart}
+          theme={theme}
+          toggleTheme={toggleTheme}
+        />
+      )}
+      {!["explorer", "landing", "quick"].includes(phase) && (
+        <button className="skip-btn" onClick={handleSkip} title="Skip to dashboard">SKIP ▸</button>
+      )}
     </div>
     </ErrorBoundary>
   );
@@ -871,26 +1012,21 @@ export default function App() {
 // ============================================================================
 // EXPLORER
 // ============================================================================
-function Explorer({ initialData, onRestart, theme, toggleTheme }) {
-  const initSector = initialData?.sector || "infrastructure";
-  const initState = initialData?.state || DEFAULTS.state;
-  const initInputs = initialData ? {
-    projectValue: Number(initialData.projectValue) || DEFAULTS.projectValue, duration: Number(initialData.duration) || DEFAULTS.duration,
-    permits: Number(initialData.permits) || PRESETS[initSector].permits, workers: Number(initialData.workers) || PRESETS[initSector].workers,
-    inspections: Number(initialData.inspections) || PRESETS[initSector].inspections, incidents: Number(initialData.incidents) || PRESETS[initSector].incidents,
-    siteVisits: Number(initialData.siteVisits) || PRESETS[initSector].siteVisits, staffRate: Number(initialData.staffRate) || PRESETS[initSector].staffRate,
-    state: initialData?.state || DEFAULTS.state,
-  } : { ...DEFAULTS, ...PRESETS.infrastructure, state: DEFAULTS.state };
+function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) {
+  const boot = restoreState || {};
+  const initSector = boot.sector || initialData?.sector || "infrastructure";
+  const initState = boot.selectedState || initialData?.state || DEFAULTS.state;
+  const initInputs = boot.inputs || (initialData ? buildInputsFromSector(initSector, initialData) : buildInputsFromSector(initSector, { state: initState }));
 
   const [tab, setTab] = useState("analysis");
   const [sector, setSector] = useState(initSector);
   const [inputs, setInputs] = useState(initInputs);
   const [selectedState, setSelectedState] = useState(initState);
-  const [projectName, setProjectName] = useState(initialData?.projectName || "");
-  const [confirmedName, setConfirmedName] = useState((initialData?.projectName || "").toUpperCase());
+  const [projectName, setProjectName] = useState(boot.projectName ?? initialData?.projectName ?? "");
+  const [confirmedName, setConfirmedName] = useState(boot.confirmedName ?? (initialData?.projectName || "").toUpperCase());
   const [nameScramble, setNameScramble] = useState(0);
-  const [scenarios, setScenarios] = useState([null, null, null]);
-  const [scenarioNames, setScenarioNames] = useState(["SCENARIO 1", "SCENARIO 2", "SCENARIO 3"]);
+  const [scenarios, setScenarios] = useState(boot.scenarios || [null, null, null]);
+  const [scenarioNames, setScenarioNames] = useState(boot.scenarioNames || [...DEFAULT_SCENARIO_NAMES]);
   const [scenarioNameScrambles, setScenarioNameScrambles] = useState([0, 0, 0]);
   const [editingScenario, setEditingScenario] = useState(null);
   const [editingAt, setEditingAt] = useState(null);
@@ -919,6 +1055,8 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
   const [scrambleTrigger, setScrambleTrigger] = useState(0);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [showAssumptions, setShowAssumptions] = useState(false);
+  const [shareMsg, setShareMsg] = useState("");
   const [exportName, setExportName] = useState("");
   const [exportImage, setExportImage] = useState(null);
   const [mobileInputOpen, setMobileInputOpen] = useState(false);
@@ -932,6 +1070,15 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
   const handleBarToggle = useCallback((key) => {
     setExpanded(prev => prev === key ? null : key);
   }, []);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setExpanded(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expanded]);
 
   useEffect(() => {
     requestAnimationFrame(() => setMounted(true));
@@ -949,6 +1096,27 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
     return () => timers.forEach(clearTimeout);
   }, []);
 
+  useEffect(() => {
+    const t = setTimeout(() => {
+      saveSession({
+        guidedData: {
+          projectName: confirmedName || projectName || "PROJECT",
+          sector,
+          state: selectedState,
+          ...inputs,
+        },
+        sector,
+        selectedState,
+        inputs: { ...inputs, state: selectedState },
+        projectName,
+        confirmedName,
+        scenarios,
+        scenarioNames,
+      });
+    }, 500);
+    return () => clearTimeout(t);
+  }, [inputs, sector, selectedState, projectName, confirmedName, scenarios, scenarioNames]);
+
   // Cost of Inaction toast — appears after 30s
   useEffect(() => {
     const t = setTimeout(() => { setInactionToast(Date.now()); }, 30000);
@@ -958,7 +1126,7 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
   // Keep inputs.state in sync with selectedState (Explorer mini-map)
   useEffect(() => { setInputs(p => ({ ...p, state: selectedState })); }, [selectedState]);
 
-  const r = useMemo(() => calc(inputs), [inputs]);
+  const r = useMemo(() => calc({ ...inputs, state: selectedState }), [inputs, selectedState]);
   const bench = PRESETS[sector];
 
   // Sensitivity analysis — which sliders move the needle most?
@@ -967,7 +1135,7 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
     const keys = ["projectValue", "duration", "permits", "workers", "inspections", "incidents", "siteVisits", "staffRate"];
     const deltas = {};
     keys.forEach(k => {
-      const bumped = { ...inputs, [k]: Math.round(inputs[k] * 1.1) };
+      const bumped = { ...inputs, state: selectedState, [k]: Math.round(inputs[k] * 1.1) };
       const bumpedR = calc(bumped);
       deltas[k] = Math.abs(bumpedR.total - base);
     });
@@ -997,6 +1165,63 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
   const accent = { anomalous: VIOLET, elite: GREEN, strong: GREEN, good: BLUE, low: YELLOW, neg: RED }[tier];
   const tierLabel = { anomalous: "ANOMALOUS", elite: "EXCEPTIONAL", strong: "STRONG RETURN", good: "SOLID RETURN", low: "MODERATE RETURN", neg: "COST EXCEEDS VALUE" }[tier];
 
+  const storySentence = useMemo(
+    () =>
+      buildStorySentence({
+        confirmedName,
+        sector,
+        stateCode: selectedState,
+        states: STATES,
+        r,
+      }),
+    [confirmedName, sector, selectedState, r],
+  );
+
+  const sensDrivers = useMemo(() => topSensitivityDrivers(sensitivity, 3), [sensitivity]);
+
+  const executiveSummary = useMemo(
+    () =>
+      buildExecutiveSummary({
+        confirmedName,
+        sectorLabel: PRESETS[sector]?.label,
+        stateCode: selectedState,
+        r,
+        storySentence,
+        modelVersion: MODEL_VERSION,
+      }),
+    [confirmedName, sector, selectedState, r, storySentence],
+  );
+
+  const copyExecutiveSummary = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(executiveSummary);
+      setShareMsg("Summary copied");
+      setTimeout(() => setShareMsg(""), 2200);
+    } catch {
+      /* ignore */
+    }
+  }, [executiveSummary]);
+
+  const copyLink = useCallback(async () => {
+    await copyShareUrl({
+      guidedData: {
+        projectName: confirmedName || projectName || "PROJECT",
+        sector,
+        state: selectedState,
+        ...inputs,
+      },
+      sector,
+      selectedState,
+      inputs: { ...inputs, state: selectedState },
+      projectName,
+      confirmedName,
+      scenarios,
+      scenarioNames,
+    });
+    setShareMsg("Copied");
+    setTimeout(() => setShareMsg(""), 2200);
+  }, [confirmedName, projectName, sector, selectedState, inputs, scenarios, scenarioNames]);
+
   const sliderMouseDown = useRef(0);
   useEffect(() => {
     const down = (e) => { if (e.target.classList.contains("si-input")) sliderMouseDown.current = Date.now(); };
@@ -1025,9 +1250,47 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
   }, []);
   useEffect(() => { if (!bootDoneRef.current) { prevThresh.current = [5000000, 2000000, 1000000, 500000].find(t => r.total >= t) || 0; return; } const ts = [5000000, 2000000, 1000000, 500000]; const cur = ts.find(t => r.total >= t) || 0; if (cur > prevThresh.current) { setThreshold(cur); const t = setTimeout(() => setThreshold(null), 1200); prevThresh.current = cur; return () => clearTimeout(t); } if (cur < prevThresh.current) prevThresh.current = cur; }, [r.total]);
 
-  const set = useCallback((k, v) => setInputs(p => ({ ...p, [k]: Number(v) })), []);
-  const pick = useCallback((k) => { setSector(k); setInputs(p => ({ ...p, ...PRESETS[k] })); setScrambleTrigger(t => t + 1); setLoadedSlot(null); prevTotals.current = { t: 0, c: 0, p: 0 }; }, []);
-  const reset = useCallback(() => { setInputs({ ...DEFAULTS, ...PRESETS[sector], state: selectedState }); setExpanded(null); setScrambleTrigger(t => t + 1); setScenarios([null, null, null]); setScenarioNames(["SCENARIO 1", "SCENARIO 2", "SCENARIO 3"]); setScenarioNameScrambles([0, 0, 0]); setEditingScenario(null); setEditingAt(null); setLoadedSlot(null); prevTotals.current = { t: 0, c: 0, p: 0 }; }, [sector, selectedState]);
+  const set = useCallback((k, v) => {
+    setInputs(p => {
+      const next = { ...p, [k]: Number(v), state: selectedState };
+      if (k === "platformCost") next.platformCostAuto = false;
+      if (k === "projectValue" && p.platformCostAuto !== false) {
+        next.platformCost = defaultPlatformCost(Number(v));
+      }
+      return next;
+    });
+  }, [selectedState]);
+  const pick = useCallback((k) => {
+    setSector(k);
+    setInputs(p => ({
+      ...p,
+      ...PRESETS[k],
+      state: selectedState,
+      platformCost: p.platformCostAuto !== false ? defaultPlatformCost(p.projectValue) : p.platformCost,
+      platformCostAuto: p.platformCostAuto !== false,
+    }));
+    setScrambleTrigger(t => t + 1);
+    setLoadedSlot(null);
+    prevTotals.current = { t: 0, c: 0, p: 0 };
+  }, [selectedState]);
+  const reset = useCallback(() => {
+    setInputs({
+      ...DEFAULTS,
+      ...PRESETS[sector],
+      state: selectedState,
+      platformCost: defaultPlatformCost(DEFAULTS.projectValue),
+      platformCostAuto: true,
+    });
+    setExpanded(null);
+    setScrambleTrigger(t => t + 1);
+    setScenarios([null, null, null]);
+    setScenarioNames([...DEFAULT_SCENARIO_NAMES]);
+    setScenarioNameScrambles([0, 0, 0]);
+    setEditingScenario(null);
+    setEditingAt(null);
+    setLoadedSlot(null);
+    prevTotals.current = { t: 0, c: 0, p: 0 };
+  }, [sector, selectedState]);
 
   const confirmName = useCallback(() => {
     const name = projectName.trim().toUpperCase();
@@ -1052,7 +1315,7 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
     const down = (e) => {
       const isText = e.target.tagName === "INPUT" && e.target.type === "text"; if (isText || e.target.tagName === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
       if (e.key === "/") { e.preventDefault(); setShowShortcuts(true); }
-      if (e.key === "Escape") { setExpanded(null); setShowShortcuts(false); document.activeElement?.blur(); }
+      if (e.key === "Escape") { setExpanded(null); setShowShortcuts(false); setShowAssumptions(false); setShowExport(false); document.activeElement?.blur(); }
       const isRange = e.target.tagName === "INPUT" && e.target.type === "range";
       if (e.key === "ArrowLeft" && !isRange) setTab("analysis"); if (e.key === "ArrowRight" && !isRange) setTab("compare");
       if (e.key === "1") pick("infrastructure"); if (e.key === "2") pick("commercial"); if (e.key === "3") pick("residential"); if (e.key === "4") pick("industrial"); if (e.key === "5") pick("utilities");
@@ -1071,6 +1334,45 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
   const cPct = r.total > 0 ? Math.max(0, Math.min(100 - tPct, Math.round((r.c.total / r.total) * 100))) : 33;
   const pPct = Math.max(0, 100 - tPct - cPct);
   const pbPct = Math.min(100, (Math.min(r.payback, 6) / 6) * 100);
+
+  const pal = theme === "light" ? LIGHT_PAL : DARK_PAL;
+  const breakdownPanels = useMemo(() => ({
+    t: {
+      color: pal.GREEN,
+      title: "TIME SAVINGS",
+      highlight: `${r.hrs.toLocaleString()} hours/year · ${Math.max(1, Math.round(r.hrs / 2080))} FTE equivalent`,
+      rows: [
+        ["Permit workflows", r.t.permits, "~90 min saved per permit"],
+        ["Inductions & onboarding", r.t.inductions, "~30 min saved per worker"],
+        ["Inspections & audits", r.t.inspections, "~15 min per inspection"],
+        ["Incident reporting", r.t.incidents, "~60 min per report"],
+        ["Automated dashboards", r.t.dashboards, "1 day → 15 min"],
+        ["Paperless processes", r.t.paperless, "Printing & storage eliminated"],
+      ],
+    },
+    c: {
+      color: pal.BLUE,
+      title: "COST SAVINGS",
+      highlight: "One regulatory fine avoided pays for the system",
+      rows: [
+        ["Reduced site travel", r.c.travel, "~$200 per avoided visit"],
+        ["Lower insurance premiums", r.c.insurance, "2–5% premium reduction"],
+        ["Regulatory avoidance", r.c.regulatory, "Faster CAPA, better docs"],
+      ],
+    },
+    p: {
+      color: pal.ORANGE,
+      title: "PRODUCTIVITY",
+      highlight: "One prevented stoppage can save $250K–$500K",
+      rows: [
+        ["Reduced downtime", r.p.downtime, "0.5–1 day stoppage avoided"],
+        ["Workforce utilisation", r.p.workforce, "~5 unproductive days/mo avoided"],
+        ["Dispute avoidance", r.p.disputes, "One avoided dispute/year"],
+      ],
+    },
+  }), [r, theme]);
+
+  const activeBreakdown = expanded ? breakdownPanels[expanded] : null;
   const scenarioResults = scenarios.map(s => s ? calc(s) : null);
   const savedCount = scenarios.filter(Boolean).length;
 
@@ -1084,8 +1386,11 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
           <div><div style={{ fontSize: 11, letterSpacing: 1, color: "rgba(var(--trgb),0.65)", marginBottom: 6 }}>PREPARED BY</div>
           <input className="pn-input" type="text" placeholder="YOUR NAME" value={exportName} onChange={e => setExportName(e.target.value)} style={{ fontSize: 14 }} /></div>
           <div style={{ fontSize: 11, color: "rgba(var(--trgb),0.55)", letterSpacing: 1, lineHeight: 1.7 }}>
-            Project: {confirmedName || "—"}<br />State: {STATES[selectedState]?.full} ({selectedState})<br />Total Value: {fmt(r.total)} · {tierLabel}<br />Benchmark: TOP {100 - percentile}% · {STATES[selectedState].factor.toFixed(2)}×
+            Project: {confirmedName || "n/a"}<br />State: {STATES[selectedState]?.full} ({selectedState})<br />Total Value: {fmt(r.total)} · {tierLabel}<br />Reference model: {100 - percentile}th percentile · {STATES[selectedState].factor.toFixed(2)}× state
           </div>
+          <button type="button" className="gi-load" style={{ width: "100%" }} onClick={copyExecutiveSummary}>
+            Copy executive summary
+          </button>
           <button className="gi-load" style={{ width: "100%", marginTop: 4 }} onClick={() => {
             const W = 2480, H = 3508;
             const c = document.createElement("canvas"); c.width = W; c.height = H; const x = c.getContext("2d");
@@ -1097,7 +1402,7 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
             // === TOP CLASSIFICATION BAR ===
             x.fillStyle = accent + "12"; x.fillRect(0, 0, W, 72);
             x.fillStyle = accent; x.font = `600 22px ${sans}`; x.textAlign = "left"; x.letterSpacing = "2px";
-            x.fillText("CONFIDENTIAL — ROI ANALYSIS BRIEFING", L, 46);
+            x.fillText("CONFIDENTIAL · ROI ANALYSIS BRIEFING", L, 46);
             x.textAlign = "right"; x.fillStyle = dim; x.font = `400 20px ${mono}`;
             x.fillText(new Date().toLocaleDateString("en-AU", { day: "2-digit", month: "short", year: "numeric" }).toUpperCase(), R, 46);
 
@@ -1127,7 +1432,7 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
               ["ROI MULTIPLE", `${r.roiX}x`, r.roiX >= 10 ? GREEN : r.roiX >= 5 ? BLUE : YELLOW],
               ["PAYBACK", `${r.payback}mo`, r.payback <= 2 ? GREEN : r.payback <= 4 ? BLUE : YELLOW],
               ["HOURS SAVED", r.hrs.toLocaleString(), r.hrs > 5000 ? GREEN : BLUE],
-              ["BENCHMARK", `TOP ${100-percentile}%`, CYAN],
+              ["VS REFERENCE", `${100 - percentile}th pct`, CYAN],
             ];
             const kW = Math.floor((R - L - 30) / 4);
             kpis.forEach(([label, val, col], i) => {
@@ -1157,9 +1462,9 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
             });
             y += 56;
             x.font = `400 18px ${sans}`;
-            x.fillStyle = GREEN; x.fillText(`TIME ${tPct}% — ${fmt(r.t.total)}`, L, y);
-            x.fillStyle = BLUE; x.fillText(`COST ${cPct}% — ${fmt(r.c.total)}`, L + 700, y);
-            x.fillStyle = ORANGE; x.fillText(`PRODUCTIVITY ${pPct}% — ${fmt(r.p.total)}`, L + 1400, y);
+            x.fillStyle = GREEN; x.fillText(`TIME ${tPct}% · ${fmt(r.t.total)}`, L, y);
+            x.fillStyle = BLUE; x.fillText(`COST ${cPct}% · ${fmt(r.c.total)}`, L + 700, y);
+            x.fillStyle = ORANGE; x.fillText(`PRODUCTIVITY ${pPct}% · ${fmt(r.p.total)}`, L + 1400, y);
 
             // === SAVINGS BREAKDOWN TABLE ===
             y += 70;
@@ -1224,11 +1529,12 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
             x.fillStyle = "rgba(255,255,255,0.04)"; x.fillRect(0, H - 140, W, 140);
             x.fillStyle = accent + "40"; x.fillRect(0, H - 140, W, 1);
             x.textAlign = "left"; x.fillStyle = dim; x.font = `400 18px ${sans}`;
-            x.fillText(`Prepared by: ${exportName || "—"}`, L, H - 90);
+            x.fillText(`Prepared by: ${exportName || "n/a"}`, L, H - 90);
             x.fillText(`Date: ${new Date().toLocaleDateString("en-AU")}`, L, H - 58);
             x.textAlign = "right"; x.fillStyle = "rgba(255,255,255,0.2)"; x.font = `500 16px ${sans}`;
             x.fillText("POWERED BY PRESCIENCE + NOVADE", R, H - 90);
-            x.fillText("INDICATIVE ANALYSIS — ALL FIGURES IN AUD", R, H - 58);
+            x.fillText("INDICATIVE ANALYSIS · ALL FIGURES IN AUD", R, H - 58);
+            x.fillText(`Model v${MODEL_VERSION}`, R, H - 32);
 
             // === DOWNLOAD ===
             try {
@@ -1265,10 +1571,11 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
       </div>}
       {threshold && <div className="thresh-flash" />}
       <header className="hdr">
+        <div className="hdr-row">
         <div className="hdr-l">
           <img src={prescienceMark} alt="Prescience Technology" title="Prescience Technology" className="hdr-mark" />
           <span className="hdr-div" />
-          <div className="hdr-title">ROI ANALYSIS ENGINE</div>
+          <div className="hdr-title">Novade Field Management · ROI</div>
         </div>
         <div className="hdr-tabs">
           <button className={`htab ${tab === "analysis" ? "htab-ac" : ""}`} onClick={e => { setTab("analysis"); e.target.blur(); }}>ANALYSIS</button>
@@ -1278,15 +1585,37 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
           <button className="hdr-btn theme-toggle" onClick={e => { toggleTheme(); e.target.blur(); }} title="Toggle light mode">{theme === "dark" ? "☀ LIGHT" : "☾ DARK"}</button>
           <div className="status"><span className="dot" style={{ background: accent, boxShadow: `0 0 6px ${accent}` }} />LIVE</div>
           <button className="hdr-btn sc-btn" onClick={e => { setShowShortcuts(s => !s); e.target.blur(); }}>?</button>
-          <button className="hdr-btn" onClick={e => { setShowExport(true); e.target.blur(); }}>↓ EXPORT</button>
-          <button className="hdr-btn" onClick={e => { reset(); e.target.blur(); }}>RESET</button>
-          {onRestart && <button className="hdr-btn" onClick={e => { e.target.blur(); onRestart(); }}>◁ NEW</button>}
+          <button className="hdr-btn" onClick={e => { copyLink(); e.target.blur(); }} title="Copy share link">
+            ⧉ LINK{shareMsg ? <span className="hdr-share-msg">{shareMsg}</span> : null}
+          </button>
+          <button className="hdr-btn" onClick={e => { setShowAssumptions(true); e.target.blur(); }} title="Model assumptions">ASSUMP.</button>
+          <button className="hdr-btn" onClick={e => { setShowExport(true); e.target.blur(); }} title="Export briefing PNG">EXPORT</button>
+          <button className="hdr-btn hdr-btn-muted" onClick={e => { reset(); e.target.blur(); }} title="Reset inputs to defaults">RESET</button>
+          {onRestart && <button className="hdr-btn hdr-btn-muted" onClick={e => { e.target.blur(); onRestart(); }} title="Start a new project">NEW</button>}
           <span className="meta">{new Date().toLocaleDateString("en-AU", { day: "2-digit", month: "short", year: "numeric" }).toUpperCase()}</span>
         </div>
+        </div>
+        <ScenarioStrip
+          className="hdr-scenarios desk-show"
+          bootClass={`ai${bootVisible[0] ? " booted" : ""}`}
+          editSlot="header"
+          scenarios={scenarios}
+          scenarioNames={scenarioNames}
+          scenarioNameScrambles={scenarioNameScrambles}
+          slotFlash={slotFlash}
+          editingScenario={editingScenario}
+          editingAt={editingAt}
+          onSave={saveSlot}
+          onLoad={loadSlot}
+          onClear={clearSlot}
+          onStartEdit={(i, at) => { setEditingScenario(i); setEditingAt(at); }}
+          onFinishEdit={finishScenarioEdit}
+        />
       </header>
       <div className="main">
-        <div className={`left ${mobileInputOpen ? "left-open" : ""}`}>
+        <div className={`left ${mobileInputOpen ? "left-open" : ""} dash-inputs`}>
           <button className="mob-toggle mob-show" onClick={() => setMobileInputOpen(p => !p)}>{mobileInputOpen ? "▾ HIDE INPUTS" : "▸ ADJUST INPUTS"}</button>
+          <div className="left-inputs-scroll">
           <div className="sh"><span className="sl">PROJECT</span></div>
           <div className="pn-w">
             <input className="pn-input" type="text" placeholder="PROJECT NAME ↵" value={projectName} ref={nameInputRef} onChange={e => { if (!nameScrambling) setProjectName(e.target.value); }} onKeyDown={e => { if (e.key === "Enter") { e.target.blur(); confirmName(); } }} maxLength={35} readOnly={nameScrambling} />
@@ -1296,10 +1625,16 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
           <div className="sh"><span className="sl">SECTOR</span></div>
           <div className="sg">{Object.entries(PRESETS).map(([k, v]) => <button key={k} className={`sb ${sector === k ? "ac" : ""}`} onClick={() => pick(k)}>{v.label}</button>)}</div>
           <div className="sh"><span className="sl">STATE</span><span style={{ fontSize: 10, color: "rgba(var(--trgb),0.55)", letterSpacing: 1 }}><Tip text={TIPS.state}><span className="si-q">?</span></Tip> {STATES[selectedState]?.full}</span></div>
-          <div className="sg" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>{STATE_ORDER.map(code => <button key={code} className={`sb ${selectedState === code ? "ac" : ""}`} onClick={() => setSelectedState(code)} style={{ padding: "8px 4px", fontSize: 12 }}>{code}</button>)}</div>
+          <div className="sg" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>{STATE_ORDER.map(code => <button key={code} className={`sb ${selectedState === code ? "ac" : ""}`} onClick={() => { setSelectedState(code); setInputs(p => ({ ...p, state: code })); setScrambleTrigger(t => t + 1); }} style={{ padding: "8px 4px", fontSize: 12 }}>{code}</button>)}</div>
           <div className="sh"><span className="sl">PROJECT SCOPE</span></div>
           <Sl k="projectValue" label="VALUE" val={inputs.projectValue} min={5} max={1000} step={5} fmt={v => `$${v}M`} bench={100} bL="MID" set={set} accent={accent} sens={sensitivity.projectValue} />
           <Sl k="duration" label="DURATION" val={inputs.duration} min={3} max={72} step={3} fmt={v => `${v}MO`} bench={24} bL="2YR" set={set} accent={accent} sens={sensitivity.duration} />
+          <div className="sh"><span className="sl">PLATFORM COST</span><Tip text={TIPS.platformCost}><span className="si-q">?</span></Tip></div>
+          <Sl k="platformCost" label="ANNUAL ($)" val={inputs.platformCost ?? defaultPlatformCost(inputs.projectValue)} min={6000} max={120000} step={1000} fmt={v => fmt(v)} bench={r.swSuggested} bL="EST" set={set} accent={YELLOW} sens="mid" />
+          {inputs.platformCostAuto === false && <div className="plat-hint">Custom; not tied to contract size</div>}
+          <button type="button" className="plat-reset" onClick={() => setInputs(p => ({ ...p, platformCost: defaultPlatformCost(p.projectValue), platformCostAuto: true }))}>
+            Reset to estimate ({fmt(r.swSuggested)}/yr)
+          </button>
           <div className="dv" />
           <div className="sh"><span className="sl">OPERATIONAL VOLUME</span></div>
           <Sl k="permits" label="PERMITS / MO" val={inputs.permits} min={0} max={2000} step={10} bench={500} bL="AVG" set={set} accent={accent} sens={sensitivity.permits} />
@@ -1308,30 +1643,23 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
           <Sl k="incidents" label="INCIDENTS / YR" val={inputs.incidents} min={0} max={500} step={5} bench={100} bL="AVG" set={set} accent={accent} sens={sensitivity.incidents} />
           <Sl k="siteVisits" label="SITE VISITS / MO" val={inputs.siteVisits} min={0} max={300} step={5} bench={80} bL="AVG" set={set} accent={accent} sens={sensitivity.siteVisits} />
           <Sl k="staffRate" label="STAFF RATE" val={inputs.staffRate} min={60} max={250} step={5} fmt={v => `$${v}/hr`} bench={155} bL="AVG" set={set} accent={accent} sens={sensitivity.staffRate} />
-          <div className="dv" />
-          <div className={`scenario-panel ai${bootVisible[0] ? " booted" : ""}`}>
-            <div className="sp-h"><span className="sl">SCENARIOS</span></div>
-            <div className="sp-slots">
-              {[0, 1, 2].map(i => (
-                <div key={i} className={`slot3 ${scenarios[i] ? "slot3-saved" : ""} ${slotFlash === i ? "slot-flash" : ""}`}>
-                  <div className="slot3-top">
-                    {editingScenario === i && editingAt === "left" ? (
-                      <NameEditor key={`slot-edit-${i}`} className="slot3-name-edit" value={scenarioNames[i]} onCommit={(v) => finishScenarioEdit(i, v)} />
-                    ) : (
-                      <span className="slot3-name" onClick={() => { setEditingScenario(i); setEditingAt("left"); }} title="Rename">
-                        {scenarios[i] ? "●" : "◌"} <Scramble text={scenarioNames[i]} duration={350} trigger={scenarioNameScrambles[i]} />
-                      </span>
-                    )}
-                  </div>
-                  <div className="slot3-actions">
-                    <button className="slot3-btn" onClick={() => saveSlot(i)}>{slotFlash === i ? "✓" : "SAVE"}</button>
-                    {scenarios[i] && <button className="slot3-btn slot3-load" onClick={() => loadSlot(i)}>LOAD</button>}
-                    {scenarios[i] && <button className="slot3-btn slot3-clear" onClick={() => clearSlot(i)} title="Unsave">✕</button>}
-                  </div>
-                </div>
-              ))}
-            </div>
           </div>
+          <ScenarioStrip
+            className="mob-show"
+            bootClass={`ai${bootVisible[0] ? " booted" : ""}`}
+            editSlot="left"
+            scenarios={scenarios}
+            scenarioNames={scenarioNames}
+            scenarioNameScrambles={scenarioNameScrambles}
+            slotFlash={slotFlash}
+            editingScenario={editingScenario}
+            editingAt={editingAt}
+            onSave={saveSlot}
+            onLoad={loadSlot}
+            onClear={clearSlot}
+            onStartEdit={(i, at) => { setEditingScenario(i); setEditingAt(at); }}
+            onFinishEdit={finishScenarioEdit}
+          />
           <div className="dv mob-show" />
           <div className="mob-tabs mob-show">
             <button className={`htab ${tab === "analysis" ? "htab-ac" : ""}`} onClick={e => { setTab("analysis"); e.target.blur(); }}>ANALYSIS</button>
@@ -1342,65 +1670,93 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
             {onRestart && <button className="mob-act" onClick={e => { e.target.blur(); onRestart(); }}>◁ NEW</button>}
           </div>
         </div>
-        <div className="right">
+        <div className={`right ${tab === "analysis" ? "dash-analysis" : "dash-compare"}`}>
           {tab === "analysis" ? (<>
+            <section className="dash-hero-block">
             <div className={`hero ai${bootVisible[0] ? " booted" : ""}`} style={{ borderColor: `${accent}25` }}>
               <div className="hero-aurora" style={{ background: `radial-gradient(ellipse 130% 100% at 50% -30%, ${accent}40 0%, ${accent}22 40%, transparent 65%)` }} />
               <div className="hero-aurora2" style={{ background: `radial-gradient(ellipse 90% 70% at 40% -10%, ${accent}28 0%, transparent 50%)` }} />
               <div className={`hero-pn${confirmedName ? "" : " hero-pn-empty"}`}>{confirmedName ? <Scramble text={confirmedName.length > 40 ? confirmedName.slice(0, 40) + "…" : confirmedName} duration={500} trigger={nameScramble} /> : " "}</div>
               <div className={`hero-sc${loadedSlot !== null ? "" : " hero-sc-empty"}`}><span className="hero-sc-txt">{loadedSlot !== null ? <Scramble text={scenarioNames[loadedSlot].length > 30 ? scenarioNames[loadedSlot].slice(0, 30) + "…" : scenarioNames[loadedSlot]} duration={450} trigger={loadedScramble} /> : " "}</span></div>
+              <div className="hero-head">
+                <div className="hero-lbl" style={{ color: `${accent}99` }}>ANNUAL RECOVERABLE VALUE</div>
+                <span className="hero-tier" style={{ color: accent, borderColor: `${accent}40`, background: `${accent}12` }}>{tierLabel}</span>
+              </div>
               <div className="hero-val" style={{ color: accent, textShadow: `0 0 40px ${accent}44, 0 0 80px ${accent}18` }}><HeroVal value={r.total} color={accent} trigger={bootTriggers[0]} /></div>
               <div className="thresh-w">{threshold && <div className="thresh-line" style={{ "--sc": accent }} />}</div>
-              <div className="hero-row">
-                <div className="sub"><span className="sub-l">NET SAVINGS</span><span className="sub-v lg" style={{ color: r.neg ? RED : GREEN }}><Num value={r.net} /></span></div>
-                <div className="sub"><span className="sub-l">3-YEAR PROJECTION</span><span className="sub-v lg"><Num value={r.yr3} /></span></div>
+              <div className="hero-row dash-hero-subs">
+                <div className="sub"><span className="sub-l">NET SAVINGS</span><span className="sub-v lg" style={{ color: r.neg ? RED : GREEN }}><Num value={r.net} /></span><span className="sub-sfx">after platform</span></div>
+                <div className="sub"><span className="sub-l">3-YEAR PROJECTION</span><span className="sub-v lg" style={{ color: accent }}><Num value={r.yr3} /></span></div>
                 <div className="sub"><span className="sub-l">PLATFORM COST</span><span className="sub-v lg" style={{ color: YELLOW }}><Num value={r.sw} /><span className="sub-sfx">/yr</span></span></div>
                 <div className="sub sub-coi"><span className="sub-l coi-l">COST OF INACTION</span><span className="sub-v lg coi-v"><LiveCost perDay={r.dailyLoss} /><span className="sub-sfx">/day</span></span><div className="coi-line" /></div>
-                <div className="sub sub-bench"><span className="sub-l" style={{ color: `${CYAN}88` }}>BENCHMARK</span><span className="sub-v lg" style={{ color: CYAN }}>TOP {100 - percentile}%<span className="sub-sfx"> · {(PRESETS[sector]?.label || "").slice(0,5)}</span></span></div>
+                <div className="sub sub-bench"><span className="sub-l" style={{ color: `${CYAN}88` }}>VS REFERENCE</span><span className="sub-v lg" style={{ color: CYAN }}>{100 - percentile}th pct<span className="sub-sfx"> · {(PRESETS[sector]?.label || "").slice(0, 5)}</span></span></div>
               </div>
             </div>
-            <div className={`kpis ai${bootVisible[1] ? " booted" : ""}`}>
+            <p className="hero-story dash-story">{storySentence}</p>
+            {sensDrivers.length > 0 && (
+              <p className="sens-strip dash-sens">
+                <strong>Moves the needle:</strong> {sensDrivers.join(" · ")}
+              </p>
+            )}
+            <p className="dash-sec-label">Key metrics</p>
+            <div className={`kpis dash-kpis ai${bootVisible[1] ? " booted" : ""}`}>
               <Kpi label="ROI MULTIPLE" val={`${r.roiX}x`} color={r.roiX >= 10 ? GREEN : r.roiX >= 5 ? BLUE : r.neg ? RED : YELLOW} g={Math.min(1, r.roiX / 20)} tip="Annual return per dollar spent" scr={scrambleTrigger} />
               <Kpi label="PAYBACK" val={`${r.payback}mo`} color={r.payback <= 2 ? GREEN : r.payback <= 4 ? BLUE : YELLOW} g={Math.min(1, 4 / Math.max(r.payback, 0.5))} tip="Months until cost is recovered" scr={scrambleTrigger} />
               <Kpi label="HOURS SAVED" val={r.hrs.toLocaleString()} color={r.hrs > 5000 ? GREEN : r.hrs > 2000 ? BLUE : ORANGE} g={Math.min(1, r.hrs / 8000)} tip="Annual staff hours returned" scr={scrambleTrigger} />
               <Kpi label="EFFICIENCY" val={grade} color={grade.startsWith("A") ? GREEN : grade.startsWith("B") ? BLUE : YELLOW} g={eff / 100} tip="Volume vs sector benchmarks" scr={scrambleTrigger} />
             </div>
-            <div className={`tl ai${bootVisible[2] ? " booted" : ""}`} style={{ background: `radial-gradient(ellipse 100% 200% at 50% 100%, ${accent}0C 0%, transparent 60%), rgba(var(--trgb),0.025)`, boxShadow: `0 0 20px ${accent}08` }}>
+            </section>
+            <section className={`dash-mid${expanded ? " dash-mid-expanded" : ""}`}>
+            <section className="dash-charts">
+            <div className={`tl ai${bootVisible[2] ? " booted" : ""}`}>
               <div className="tl-h"><span className="tl-l">PAYBACK TIMELINE</span><span className="tl-v" style={{ color: r.payback <= 2 ? GREEN : r.payback <= 4 ? BLUE : YELLOW }}>{r.payback < 6 ? `${r.payback} MONTHS` : "EXTENDED"}</span></div>
               <div className="tl-track"><div className="tl-fill" style={{ width: `${pbPct}%`, background: `linear-gradient(90deg, ${accent}44, ${accent})`, boxShadow: `0 0 18px ${accent}40` }} /><div className="tl-marker" style={{ left: `${Math.min(95, pbPct)}%` }}><div className="tl-pip" style={{ background: accent, boxShadow: `0 0 14px ${accent}, 0 0 28px ${accent}55` }} /><div className="tl-pip-lbl" style={{ color: accent }}>{r.payback}mo</div></div></div>
               <div className="tl-ticks">{[0,1,2,3,4,5,6].map(m => <span key={m} className="tl-tick" style={{ left: `${(m/6)*100}%` }}><span className="tl-tick-ln" /><span className="tl-tick-n">{m}</span></span>)}</div>
             </div>
-            <div className={`dist ai${bootVisible[3] ? " booted" : ""}`} style={{ background: `radial-gradient(ellipse 100% 200% at 50% 100%, ${accent}0C 0%, transparent 60%), rgba(var(--trgb),0.025)`, boxShadow: `0 0 20px ${accent}08` }}>
+            </section>
+            <section className="dash-bds">
+            <div className={`dist dash-dist-block ai${bootVisible[3] ? " booted" : ""}`}>
               <div className="dist-h"><span className="dist-l">VALUE DISTRIBUTION</span><span className="dist-total" style={{ color: accent }}>{`${fmt(r.total)} TOTAL`}</span></div>
-              <div className="dist-bar"><div className="dist-seg" style={{ width: `${tPct}%`, background: GREEN, boxShadow: `0 0 18px ${GREEN}40` }} /><div className="dist-seg" style={{ width: `${cPct}%`, background: BLUE, boxShadow: `0 0 18px ${BLUE}40` }} /><div className="dist-seg" style={{ width: `${pPct}%`, background: ORANGE, boxShadow: `0 0 18px ${ORANGE}40` }} /></div>
-              <div className="dist-leg"><span className="dl"><span className="dd" style={{ background: GREEN, boxShadow: `0 0 10px ${GREEN}60` }} />TIME {tPct}% — {fmt(r.t.total)}</span><span className="dl"><span className="dd" style={{ background: BLUE, boxShadow: `0 0 10px ${BLUE}60` }} />COST {cPct}% — {fmt(r.c.total)}</span><span className="dl"><span className="dd" style={{ background: ORANGE, boxShadow: `0 0 10px ${ORANGE}60` }} />PRODUCTIVITY {pPct}% — {fmt(r.p.total)}</span></div>
+              <div className="dist-bar" aria-hidden="true"><div className="dist-seg" style={{ width: `${tPct}%`, background: GREEN }} /><div className="dist-seg" style={{ width: `${cPct}%`, background: BLUE }} /><div className="dist-seg" style={{ width: `${pPct}%`, background: ORANGE }} /></div>
+              <p className="dash-bds-hint">{expanded ? "Tap the highlighted category again to close" : "Tap a category for line-item breakdown"}</p>
             </div>
             <div className="bds-wrap">
               <div className={`bds-item ai${bootVisible[4] ? " booted" : ""}`}>
-                <Bd color={GREEN} tag="TIME SAVINGS" total={r.t.total} pct={tPct} scr={scrambleTrigger} open={expanded === "t"} toggle={() => handleBarToggle("t")} rows={[["Permit workflows", r.t.permits, "~90 min saved per permit"], ["Inductions & onboarding", r.t.inductions, "~30 min saved per worker"], ["Inspections & audits", r.t.inspections, "~15 min per inspection"], ["Incident reporting", r.t.incidents, "~60 min per report"], ["Automated dashboards", r.t.dashboards, "1 day → 15 min"], ["Paperless processes", r.t.paperless, "Printing & storage eliminated"]]} highlight={`${r.hrs.toLocaleString()} hours/year — ${Math.max(1, Math.round(r.hrs / 2080))} FTE equivalent`} />
+                <Bd hideBody color={GREEN} tag="TIME SAVINGS" total={r.t.total} pct={tPct} scr={scrambleTrigger} open={expanded === "t"} toggle={() => handleBarToggle("t")} rows={[]} highlight="" />
               </div>
               <div className={`bds-item ai${bootVisible[5] ? " booted" : ""}`}>
-                <Bd color={BLUE} tag="COST SAVINGS" total={r.c.total} pct={cPct} scr={scrambleTrigger} open={expanded === "c"} toggle={() => handleBarToggle("c")} rows={[["Reduced site travel", r.c.travel, "~$200 per avoided visit"], ["Lower insurance premiums", r.c.insurance, "2-5% premium reduction"], ["Regulatory avoidance", r.c.regulatory, "Faster CAPA, better docs"]]} highlight="1 regulatory fine avoided pays for the system" />
+                <Bd hideBody color={BLUE} tag="COST SAVINGS" total={r.c.total} pct={cPct} scr={scrambleTrigger} open={expanded === "c"} toggle={() => handleBarToggle("c")} rows={[]} highlight="" />
               </div>
               <div className={`bds-item ai${bootVisible[6] ? " booted" : ""}`}>
-                <Bd color={ORANGE} tag="PRODUCTIVITY" total={r.p.total} pct={pPct} scr={scrambleTrigger} open={expanded === "p"} toggle={() => handleBarToggle("p")} rows={[["Reduced downtime", r.p.downtime, "0.5–1 day stoppage avoided"], ["Workforce utilisation", r.p.workforce, "~5 unproductive days/mo avoided"], ["Dispute avoidance", r.p.disputes, "1 avoided dispute/year"]]} highlight="1 prevented stoppage = $250K–$500K saved" />
+                <Bd hideBody color={ORANGE} tag="PRODUCTIVITY" total={r.p.total} pct={pPct} scr={scrambleTrigger} open={expanded === "p"} toggle={() => handleBarToggle("p")} rows={[]} highlight="" />
               </div>
             </div>
-            <div className="ctx-wrap">
+            {activeBreakdown && (
+              <div className="bds-detail-slot" key={expanded}>
+                <BreakdownDetail
+                  color={activeBreakdown.color}
+                  title={activeBreakdown.title}
+                  highlight={activeBreakdown.highlight}
+                  rows={activeBreakdown.rows}
+                  scr={scrambleTrigger}
+                />
+              </div>
+            )}
+            </section>
+            </section>
+            <section className="dash-foot">
+            <p className="dash-sec-label">Context</p>
+            <div className="ctx-wrap dash-foot-ctx">
               <div className={`ctx ai${bootVisible[7] ? " booted" : ""}`}>
-                <div className="ctx-i" style={{ background: `radial-gradient(ellipse at 0% 0%, ${CYAN}10 0%, transparent 50%), rgba(var(--trgb),0.025)`, boxShadow: `0 0 15px ${CYAN}08` }}><span className="ctx-ic" style={{ color: CYAN }}>◆</span><div><span className="ctx-l">WORKFORCE EQUIVALENT</span><span className="ctx-v">{`${Math.max(1, Math.round(r.total / 155000))} additional site engineers`}</span></div></div>
-                <div className="ctx-i" style={{ background: `radial-gradient(ellipse at 0% 0%, ${CYAN}10 0%, transparent 50%), rgba(var(--trgb),0.025)`, boxShadow: `0 0 15px ${CYAN}08` }}><span className="ctx-ic" style={{ color: CYAN }}>◆</span><div><span className="ctx-l">CONSERVATIVE (50%)</span><span className="ctx-v">{`${fmt(Math.round(r.total * 0.5))} still recovered annually`}</span></div></div>
-                <div className="ctx-i" style={{ background: `radial-gradient(ellipse at 0% 0%, ${CYAN}10 0%, transparent 50%), rgba(var(--trgb),0.025)`, boxShadow: `0 0 15px ${CYAN}08` }}><span className="ctx-ic" style={{ color: CYAN }}>◆</span><div><span className="ctx-l">DAILY IMPACT</span><span className="ctx-v">{`${fmt(r.dailyLoss)} per working day`}</span></div></div>
-              </div>
-              <div className={`ex ai${bootVisible[7] ? " booted" : ""}`}>
-                <div className="ex-i"><span className="ex-l">NET SAVINGS / YEAR</span><span className="ex-v" style={{ color: r.neg ? RED : GREEN }}><Num value={r.net} /></span><span className="ex-n">after {fmt(r.sw)}/yr platform cost</span></div>
-                <div className="ex-i"><span className="ex-l" style={{ color: `${accent}aa` }}>3-YEAR PROJECTION</span><span className="ex-v" style={{ color: accent }}><Num value={r.yr3} /></span><span className="ex-n">if annual savings hold steady</span></div>
-                <div className="ex-i"><span className="ex-l">RETURN ON PLATFORM</span><span className="ex-v">{r.roiX}<span className="ex-sfx">x</span></span><span className="ex-n">annual multiple of budget</span></div>
+                <div className="ctx-i"><span className="ctx-ic" style={{ color: CYAN }}>◆</span><div><span className="ctx-l">WORKFORCE EQUIVALENT</span><span className="ctx-v">{`${Math.max(1, Math.round(r.total / 155000))} additional site engineers`}</span></div></div>
+                <div className="ctx-i"><span className="ctx-ic" style={{ color: CYAN }}>◆</span><div><span className="ctx-l">CONSERVATIVE (50%)</span><span className="ctx-v">{`${fmt(Math.round(r.total * 0.5))} still recovered annually`}</span></div></div>
+                <div className="ctx-i"><span className="ctx-ic" style={{ color: CYAN }}>◆</span><div><span className="ctx-l">REGION · {selectedState}</span><span className="ctx-v">{`${STATES[selectedState]?.full} · ${STATES[selectedState]?.factor.toFixed(2)}× factor`}</span></div></div>
               </div>
             </div>
+            </section>
           </>) : (
             <div className={`compare ai${bootVisible[0] ? " booted" : ""}`}>
-              {savedCount < 2 ? (<div className="cmp-empty"><div className="cmp-empty-ic">⇄</div><div className="cmp-empty-t">SCENARIO COMPARISON</div><div className="cmp-empty-s">Save at least 2 scenarios to compare side by side.</div><div className="cmp-status">{[0,1,2].map(i => <span key={i} style={{ color: scenarios[i] ? scColors()[i] : "rgba(var(--trgb),0.6)" }}>{scenarios[i] ? `● ${scenarioNames[i]}` : `◌ ${scenarioNames[i]}`}</span>)}</div></div>
+              {savedCount < 2 ? (<div className="cmp-empty"><div className="cmp-empty-ic">⇄</div><div className="cmp-empty-t">Scenario comparison</div><div className="cmp-empty-s">Pin two versions (baseline vs proposed) to compare side by side. First pinned slot is the baseline.</div><div className="cmp-status">{[0,1,2].map(i => <span key={i} style={{ color: scenarios[i] ? scColors()[i] : "rgba(var(--trgb),0.6)" }}>{scenarios[i] ? `● ${scenarioNames[i]}` : `◌ ${scenarioNames[i]}`}</span>)}</div><button type="button" className="gi-load cmp-pin-cta" onClick={() => saveSlot(0)}>Pin current as baseline</button></div>
               ) : (<>
                 <div className="cmp-grid desk-show">
                   <div className="cmp-hdr" style={{ gridTemplateColumns: `180px ${scenarios.map((s,i) => s ? "1fr" : "").filter(Boolean).join(" ")}` }}>
@@ -1429,7 +1785,23 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
                       <div className="cmp-label">{row.label}</div>
                       {row.vals.map((v, vi) => {
                         const isBest = numVals[vi] === best && numVals.length > 1 && delta > 0;
-                        return <div key={vi} className="cmp-val" style={isBest ? { color: GREEN } : {}}>{v}</div>;
+                        const base = numVals[0];
+                        const cur = numVals[vi];
+                        const diff = vi > 0 ? cur - base : 0;
+                        const higher = row.higherIsBetter !== false;
+                        const good = vi > 0 && (higher ? diff > 0 : diff < 0);
+                        let vs = null;
+                        if (vi > 0 && diff !== 0) {
+                          vs = row.dollar
+                            ? (diff > 0 ? `+${fmt(diff)}` : fmt(diff))
+                            : `${diff > 0 ? "+" : ""}${diff.toLocaleString()}${row.suf || ""} vs baseline`;
+                        }
+                        return (
+                          <div key={vi} className="cmp-val" style={isBest ? { color: GREEN } : {}}>
+                            {v}
+                            {vs && <span className="cmp-vs" style={{ color: good ? GREEN : RED }}>{vs}</span>}
+                          </div>
+                        );
                       })}
                     </div>
                   );})}
@@ -1464,7 +1836,8 @@ function Explorer({ initialData, onRestart, theme, toggleTheme }) {
         </div>
       </div>
       {inactionToast && <InactionToast startTime={inactionToast} dailyLoss={r.dailyLoss} onDismiss={() => setInactionToast(null)} />}
-      <footer className="ftr"><span>INDICATIVE ANALYSIS — NOVADE DEPLOYMENT BENCHMARKS — ALL FIGURES IN AUD</span><span>FIELD OPS v3.0</span></footer>
+      <AssumptionsPanel open={showAssumptions} onClose={() => setShowAssumptions(false)} inputs={{ ...inputs, state: selectedState }} results={r} />
+      <footer className="ftr"><span>Indicative analysis · Novade field benchmarks · AUD</span><span>Prescience Technology · Model v{MODEL_VERSION}</span></footer>
     </div>
   );
 }
@@ -1489,6 +1862,8 @@ function cmpRows(results, scenarios) {
     rawVals: active.map(a => f.get(a.r)),
     higherIsBetter: f.higherIsBetter,
     indices: active.map(a => a.i),
+    dollar: !!f.dollar,
+    suf: f.suf || "",
   }));
 }
 function Sl({ k, label, val, min, max, step, fmt: f, bench, bL, set, accent, sens }) {
@@ -1537,7 +1912,57 @@ function Sl({ k, label, val, min, max, step, fmt: f, bench, bL, set, accent, sen
   );
 }
 function Kpi({ label, val, color, g, tip, scr }) { const [hover, setHover] = useState(false); const gl = Math.max(0.1, Math.min(1, g)); const bO = Math.round(30 + gl * 70).toString(16).padStart(2, "0"); const sO = Math.round(15 + gl * 45).toString(16).padStart(2, "0"); const iO = Math.round(5 + gl * 18).toString(16).padStart(2, "0"); return (<div className="kpi" style={{ borderColor: `${color}${bO}`, boxShadow: `0 0 ${Math.round(12 + gl * 40)}px ${color}${sO}, inset 0 0 ${Math.round(gl * 30)}px ${color}${Math.round(gl * 8).toString(16).padStart(2, "0")}`, background: `radial-gradient(ellipse 120% 140% at 50% 110%, ${color}${iO} 0%, transparent 55%), rgba(var(--trgb),0.025)` }} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}><div className="kpi-l">{label}</div><div className="kpi-v" style={{ color, textShadow: `0 0 ${Math.round(12 + gl * 28)}px ${color}66, 0 0 ${Math.round(20 + gl * 40)}px ${color}22` }}><Scramble text={val} duration={300} trigger={scr || 0} /></div>{hover && tip && <div className="kpi-tip">{tip}</div>}</div>); }
-function Bd({ color, tag, total, pct, scr, open, toggle, rows, highlight }) { return (<div className={`bd ${open ? "open" : ""}`} style={{ borderLeftColor: open ? color : "transparent", background: open ? `radial-gradient(ellipse 100% 80% at 0% 0%, ${color}0C 0%, transparent 50%), rgba(var(--trgb),0.03)` : `rgba(var(--trgb),0.025)`, boxShadow: open ? `0 0 20px ${color}0A` : 'none' }} onClick={toggle}><div className="bd-h"><div className="bd-hl"><span className="bd-tag" style={{ color, borderColor: `${color}55` }}>{tag}</span><span className="bd-tot"><Scramble text={fmt(total)} duration={300} trigger={scr} /></span><span className="bd-pct" style={{ color: `${color}88` }}>{pct}%</span></div><span className="bd-chev" style={{ transform: open ? "rotate(90deg)" : "", color: open ? color : "rgba(var(--trgb),0.3)" }}>›</span></div><div className="bd-minibar"><div className="bd-minibar-f" style={{ width: `${pct}%`, background: color, boxShadow: `0 0 12px ${color}45` }} /></div>{highlight && <div className="bd-hl-row" style={{ color }}>{highlight}</div>}<div className="bd-b"><div className="bd-bi">{rows.map(([n, v, note], i) => (<div key={i} className="bd-r"><span className="bd-rn">{n}<span className="bd-rno">{note}</span></span><span className="bd-rv" style={{ color: `${color}CC` }}><Scramble text={`$${v.toLocaleString()}`} duration={280} trigger={scr} /></span></div>))}</div></div></div>); }
+function Bd({ color, tag, total, pct, scr, open, toggle, rows, highlight, hideBody }) {
+  const onKey = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggle();
+    }
+  };
+  return (
+    <div
+      className={`bd ${open ? "open" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-expanded={open}
+      aria-label={`${tag}: ${fmt(total)}, ${pct} percent. ${open ? "Collapse" : "Expand"} line items.`}
+      style={{
+        borderLeftColor: open ? color : "transparent",
+        background: open
+          ? `radial-gradient(ellipse 100% 80% at 0% 0%, ${color}0C 0%, transparent 50%), rgba(var(--trgb),0.03)`
+          : `rgba(var(--trgb),0.025)`,
+        boxShadow: open ? `0 0 20px ${color}0A` : "none",
+      }}
+      onClick={toggle}
+      onKeyDown={onKey}
+    >
+      <div className="bd-h">
+        <div className="bd-hl">
+          <span className="bd-tag" style={{ color, borderColor: `${color}55` }}>{tag}</span>
+          <span className="bd-tot"><Scramble text={fmt(total)} duration={300} trigger={scr} /></span>
+          <span className="bd-pct" style={{ color: `${color}88` }}>{pct}%</span>
+        </div>
+        <span className="bd-chev" style={{ transform: open ? "rotate(90deg)" : "", color: open ? color : "rgba(var(--trgb),0.3)" }} aria-hidden>
+          ›
+        </span>
+      </div>
+      <div className="bd-minibar"><div className="bd-minibar-f" style={{ width: `${pct}%`, background: color, boxShadow: `0 0 12px ${color}45` }} /></div>
+      {!hideBody && highlight && <div className="bd-hl-row" style={{ color }}>{highlight}</div>}
+      {!hideBody && (
+        <div className="bd-b">
+          <div className="bd-bi">
+            {rows.map(([n, v, note], i) => (
+              <div key={i} className="bd-r">
+                <span className="bd-rn">{n}<span className="bd-rno">{note}</span></span>
+                <span className="bd-rv" style={{ color: `${color}CC` }}><Scramble text={`$${v.toLocaleString()}`} duration={280} trigger={scr} /></span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function InactionToast({ startTime, dailyLoss, onDismiss }) {
   const [lost, setLost] = useState(0);
