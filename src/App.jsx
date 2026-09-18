@@ -1081,6 +1081,15 @@ function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) 
   }, [expanded]);
 
   useEffect(() => {
+    if (!expanded || typeof window === "undefined") return;
+    if (!window.matchMedia("(max-width: 900px)").matches) return;
+    const id = requestAnimationFrame(() => {
+      document.getElementById(`bds-detail-${expanded}`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [expanded]);
+
+  useEffect(() => {
     requestAnimationFrame(() => setMounted(true));
     const timers = [];
     // 0:hero 1:kpis 2:timeline 3:distribution 4:time 5:cost 6:productivity 7:context
@@ -1372,7 +1381,6 @@ function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) 
     },
   }), [r, theme]);
 
-  const activeBreakdown = expanded ? breakdownPanels[expanded] : null;
   const scenarioResults = scenarios.map(s => s ? calc(s) : null);
   const savedCount = scenarios.filter(Boolean).length;
 
@@ -1570,20 +1578,21 @@ function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) 
         </div>
       </div>}
       {threshold && <div className="thresh-flash" />}
+      <div className="app-top-chrome">
       <header className="hdr">
         <div className="hdr-row">
         <div className="hdr-l">
           <img src={prescienceMark} alt="Prescience Technology" title="Prescience Technology" className="hdr-mark" />
           <span className="hdr-div" />
-          <div className="hdr-title">Novade Field Management · ROI</div>
+          <div className="hdr-title" title="Novade Field Management · ROI">Novade Field Management · ROI</div>
         </div>
-        <div className="hdr-tabs">
+        <div className="hdr-tabs desk-show">
           <button className={`htab ${tab === "analysis" ? "htab-ac" : ""}`} onClick={e => { setTab("analysis"); e.target.blur(); }}>ANALYSIS</button>
           <button className={`htab ${tab === "compare" ? "htab-ac" : ""}`} onClick={e => { setTab("compare"); e.target.blur(); }}>COMPARE</button>
         </div>
         <div className="hdr-r">
           <button className="hdr-btn theme-toggle" onClick={e => { toggleTheme(); e.target.blur(); }} title="Toggle light mode">{theme === "dark" ? "☀ LIGHT" : "☾ DARK"}</button>
-          <div className="status"><span className="dot" style={{ background: accent, boxShadow: `0 0 6px ${accent}` }} />LIVE</div>
+          <div className="status desk-show"><span className="dot" style={{ background: accent, boxShadow: `0 0 6px ${accent}` }} />LIVE</div>
           <button className="hdr-btn sc-btn" onClick={e => { setShowShortcuts(s => !s); e.target.blur(); }}>?</button>
           <button className="hdr-btn" onClick={e => { copyLink(); e.target.blur(); }} title="Copy share link">
             ⧉ LINK{shareMsg ? <span className="hdr-share-msg">{shareMsg}</span> : null}
@@ -1593,6 +1602,10 @@ function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) 
           <button className="hdr-btn hdr-btn-muted" onClick={e => { reset(); e.target.blur(); }} title="Reset inputs to defaults">RESET</button>
           {onRestart && <button className="hdr-btn hdr-btn-muted" onClick={e => { e.target.blur(); onRestart(); }} title="Start a new project">NEW</button>}
           <span className="meta">{new Date().toLocaleDateString("en-AU", { day: "2-digit", month: "short", year: "numeric" }).toUpperCase()}</span>
+          <button type="button" className="hdr-btn hdr-mob mob-show" onClick={e => { toggleTheme(); e.target.blur(); }} title="Toggle theme">{theme === "dark" ? "☀" : "☾"}</button>
+          <button type="button" className="hdr-btn hdr-mob mob-show" onClick={e => { copyLink(); e.target.blur(); }} title="Copy share link">⧉</button>
+          <button type="button" className="hdr-btn hdr-mob mob-show" onClick={e => { setShowAssumptions(true); e.target.blur(); }} title="Assumptions">ⓘ</button>
+          <button type="button" className="hdr-btn hdr-mob mob-show" onClick={e => { setShowExport(true); e.target.blur(); }} title="Export">↗</button>
         </div>
         </div>
         <ScenarioStrip
@@ -1612,6 +1625,11 @@ function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) 
           onFinishEdit={finishScenarioEdit}
         />
       </header>
+      <div className="mob-tab-bar mob-show" role="tablist" aria-label="Dashboard view">
+        <button type="button" role="tab" aria-selected={tab === "analysis"} className={`htab ${tab === "analysis" ? "htab-ac" : ""}`} onClick={e => { setTab("analysis"); e.target.blur(); }}>ANALYSIS</button>
+        <button type="button" role="tab" aria-selected={tab === "compare"} className={`htab ${tab === "compare" ? "htab-ac" : ""}`} onClick={e => { setTab("compare"); e.target.blur(); }}>COMPARE</button>
+      </div>
+      </div>
       <div className="main">
         <div className={`left ${mobileInputOpen ? "left-open" : ""} dash-inputs`}>
           <button className="mob-toggle mob-show" onClick={() => setMobileInputOpen(p => !p)}>{mobileInputOpen ? "▾ HIDE INPUTS" : "▸ ADJUST INPUTS"}</button>
@@ -1660,11 +1678,6 @@ function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) 
             onStartEdit={(i, at) => { setEditingScenario(i); setEditingAt(at); }}
             onFinishEdit={finishScenarioEdit}
           />
-          <div className="dv mob-show" />
-          <div className="mob-tabs mob-show">
-            <button className={`htab ${tab === "analysis" ? "htab-ac" : ""}`} onClick={e => { setTab("analysis"); e.target.blur(); }}>ANALYSIS</button>
-            <button className={`htab ${tab === "compare" ? "htab-ac" : ""}`} onClick={e => { setTab("compare"); e.target.blur(); }}>COMPARE</button>
-          </div>
           <div className="mob-actions mob-show">
             <button className="mob-act" onClick={e => { reset(); e.target.blur(); }}>RESET</button>
             {onRestart && <button className="mob-act" onClick={e => { e.target.blur(); onRestart(); }}>◁ NEW</button>}
@@ -1721,27 +1734,31 @@ function Explorer({ initialData, restoreState, onRestart, theme, toggleTheme }) 
               <p className="dash-bds-hint">{expanded ? "Tap the highlighted category again to close" : "Tap a category for line-item breakdown"}</p>
             </div>
             <div className="bds-wrap">
-              <div className={`bds-item ai${bootVisible[4] ? " booted" : ""}`}>
-                <Bd hideBody color={GREEN} tag="TIME SAVINGS" total={r.t.total} pct={tPct} scr={scrambleTrigger} open={expanded === "t"} toggle={() => handleBarToggle("t")} rows={[]} highlight="" />
-              </div>
-              <div className={`bds-item ai${bootVisible[5] ? " booted" : ""}`}>
-                <Bd hideBody color={BLUE} tag="COST SAVINGS" total={r.c.total} pct={cPct} scr={scrambleTrigger} open={expanded === "c"} toggle={() => handleBarToggle("c")} rows={[]} highlight="" />
-              </div>
-              <div className={`bds-item ai${bootVisible[6] ? " booted" : ""}`}>
-                <Bd hideBody color={ORANGE} tag="PRODUCTIVITY" total={r.p.total} pct={pPct} scr={scrambleTrigger} open={expanded === "p"} toggle={() => handleBarToggle("p")} rows={[]} highlight="" />
-              </div>
+              {[
+                { key: "t", boot: 4, color: GREEN, tag: "TIME SAVINGS", total: r.t.total, pct: tPct },
+                { key: "c", boot: 5, color: BLUE, tag: "COST SAVINGS", total: r.c.total, pct: cPct },
+                { key: "p", boot: 6, color: ORANGE, tag: "PRODUCTIVITY", total: r.p.total, pct: pPct },
+              ].map(({ key, boot, color, tag, total, pct }) => {
+                const panel = breakdownPanels[key];
+                const open = expanded === key;
+                return (
+                  <div key={key} className={`bds-item${open ? " bds-item-open" : ""} ai${bootVisible[boot] ? " booted" : ""}`}>
+                    <Bd hideBody color={color} tag={tag} total={total} pct={pct} scr={scrambleTrigger} open={open} toggle={() => handleBarToggle(key)} rows={[]} highlight="" />
+                    {open && panel && (
+                      <div className="bds-detail-slot" id={`bds-detail-${key}`}>
+                        <BreakdownDetail
+                          color={panel.color}
+                          title={panel.title}
+                          highlight={panel.highlight}
+                          rows={panel.rows}
+                          scr={scrambleTrigger}
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
-            {activeBreakdown && (
-              <div className="bds-detail-slot" key={expanded}>
-                <BreakdownDetail
-                  color={activeBreakdown.color}
-                  title={activeBreakdown.title}
-                  highlight={activeBreakdown.highlight}
-                  rows={activeBreakdown.rows}
-                  scr={scrambleTrigger}
-                />
-              </div>
-            )}
             </section>
             </section>
             <section className="dash-foot">
